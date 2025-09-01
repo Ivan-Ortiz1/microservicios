@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pagos.schemas import PagoCreate  # ✅ Importar desde pagos.schemas
 from sqlalchemy.orm import Session
 from . import models, schemas, db, auth
 import httpx
@@ -15,56 +16,107 @@ def crear_pedido(
     token: dict = Depends(auth.verificar_token),
     session: Session = Depends(db.get_db),
 ):
+    if pedido.cantidad <= 0:
+        raise HTTPException(status_code=400, detail="La cantidad debe ser mayor a 0")
 
-    # 1. Verificar stock
-    with httpx.Client() as client:
-        resp = client.get(
-            f"{PRODUCTOS_URL}/productos/{pedido.producto_id}",
-            headers={"Authorization": f"Bearer {auth.crear_token({'sub':'admin'})}"},
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            # 1. Obtener producto
+            resp = client.get(
+                f"{PRODUCTOS_URL}/productos/{pedido.producto_id}",
+                headers={
+                    "Authorization": f"Bearer {auth.crear_token({'sub': 'admin'})}"
+                },
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=404, detail="Producto no encontrado")
+
+            producto = resp.json()
+            if producto["stock"] < pedido.cantidad:
+                raise HTTPException(status_code=400, detail="Stock insuficiente")
+
+            # 2. Calcular total y descontar stock
+            total = producto["precio"] * pedido.cantidad
+            nuevo_stock = producto["stock"] - pedido.cantidad
+            stock_resp = client.put(
+                f"{PRODUCTOS_URL}/productos/{pedido.producto_id}",
+                json={
+                    "nombre": producto["nombre"],
+                    "precio": producto["precio"],
+                    "stock": nuevo_stock,
+                    "descripcion": producto.get("descripcion", ""),
+                },
+                headers={
+                    "Authorization": f"Bearer {auth.crear_token({'sub': 'admin'})}"
+                },
+            )
+            if stock_resp.status_code != 200:
+                raise HTTPException(
+                    status_code=400, detail="Error al actualizar stock del producto"
+                )
+
+            # 3. Crear pedido en DB
+            nuevo_pedido = models.Pedido(
+                producto_id=pedido.producto_id,
+                cantidad=pedido.cantidad,
+                total=total,
+                estado="pendiente",
+            )
+            session.add(nuevo_pedido)
+            session.commit()
+            session.refresh(nuevo_pedido)
+
+            # 4. Registrar pago (ahora usando PagoCreate directamente)
+            pago_data = PagoCreate(pedido_id=nuevo_pedido.id, monto=total)
+            pago_resp = client.post(
+                f"{PAGOS_URL}/pagos",
+                json=pago_data.dict(),
+                headers={
+                    "Authorization": f"Bearer {auth.crear_token({'sub': 'admin'})}"
+                },
+            )
+
+            if pago_resp.status_code != 200:
+                # Rollback manual: devolver stock y eliminar pedido
+                client.put(
+                    f"{PRODUCTOS_URL}/productos/{pedido.producto_id}",
+                    json={
+                        "nombre": producto["nombre"],
+                        "precio": producto["precio"],
+                        "stock": producto["stock"],
+                        "descripcion": producto.get("descripcion", ""),
+                    },
+                    headers={
+                        "Authorization": f"Bearer {auth.crear_token({'sub': 'admin'})}"
+                    },
+                )
+                session.delete(nuevo_pedido)
+                session.commit()
+                raise HTTPException(status_code=400, detail="Error al procesar el pago")
+
+        return nuevo_pedido
+
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=500, detail="Error de conexión con otro microservicio"
         )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=400, detail="Producto no encontrado")
 
-        producto = resp.json()
-        if producto["stock"] < pedido.cantidad:
-            raise HTTPException(status_code=400, detail="Stock insuficiente")
 
-        # 2. Descontar stock
-        nuevo_stock = producto["stock"] - pedido.cantidad
-        client.put(
-            f"{PRODUCTOS_URL}/productos/{pedido.producto_id}",
-            json={
-                "nombre": producto["nombre"],
-                "precio": producto["precio"],
-                "stock": nuevo_stock,
-                "descripcion": producto.get("descripcion", ""),
-            },
-            headers={"Authorization": f"Bearer {auth.crear_token({'sub':'admin'})}"},
-        )
+@router.get("/pedidos", response_model=list[schemas.PedidoOut])
+def listar_pedidos(
+    token: dict = Depends(auth.verificar_token),
+    session: Session = Depends(db.get_db),
+):
+    return session.query(models.Pedido).all()
 
-    # 3. Crear el pedido en la DB local con total calculado
-    total = producto["precio"] * pedido.cantidad
-    nuevo_pedido = models.Pedido(
-        producto_id=pedido.producto_id,
-        cantidad=pedido.cantidad,
-        total=total,
-        estado="pendiente",
-    )
-    session.add(nuevo_pedido)
-    session.commit()
-    session.refresh(nuevo_pedido)
 
-    # 4. Registrar el pago
-    with httpx.Client() as client:
-        pago_resp = client.post(
-            f"{PAGOS_URL}/pagos",
-            json={
-                "pedido_id": nuevo_pedido.id,
-                "monto": total,
-            },
-            headers={"Authorization": f"Bearer {auth.crear_token({'sub':'admin'})}"},
-        )
-        if pago_resp.status_code != 200:
-            raise HTTPException(status_code=400, detail="Error al procesar el pago")
-
-    return nuevo_pedido
+@router.get("/pedidos/{pedido_id}", response_model=schemas.PedidoOut)
+def obtener_pedido(
+    pedido_id: int,
+    token: dict = Depends(auth.verificar_token),
+    session: Session = Depends(db.get_db),
+):
+    pedido = session.query(models.Pedido).filter(models.Pedido.id == pedido_id).first()
+    if not pedido:
+        raise HTTPException(status_code=404, detail="Pedido no encontrado")
+    return pedido
