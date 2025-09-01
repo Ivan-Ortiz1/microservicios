@@ -3,11 +3,13 @@ from pagos.schemas import PagoCreate  # ✅ Importar desde pagos.schemas
 from sqlalchemy.orm import Session
 from . import models, schemas, db, auth
 import httpx
+import logging
 
 PRODUCTOS_URL = "http://127.0.0.1:8000"
 PAGOS_URL = "http://127.0.0.1:8002"
 
 router = APIRouter()
+logging.basicConfig(level=logging.INFO)
 
 
 @router.post("/pedidos", response_model=schemas.PedidoOut)
@@ -65,8 +67,9 @@ def crear_pedido(
             session.add(nuevo_pedido)
             session.commit()
             session.refresh(nuevo_pedido)
+            logging.info(f"Pedido {nuevo_pedido.id} creado exitosamente.")
 
-            # 4. Registrar pago (ahora usando PagoCreate directamente)
+            # 4. Registrar pago con rollback seguro
             pago_data = PagoCreate(pedido_id=nuevo_pedido.id, monto=total)
             pago_resp = client.post(
                 f"{PAGOS_URL}/pagos",
@@ -77,7 +80,8 @@ def crear_pedido(
             )
 
             if pago_resp.status_code != 200:
-                # Rollback manual: devolver stock y eliminar pedido
+                logging.error(f"Error al procesar pago para pedido {nuevo_pedido.id}.")
+                # Rollback: devolver stock y eliminar pedido
                 client.put(
                     f"{PRODUCTOS_URL}/productos/{pedido.producto_id}",
                     json={
@@ -97,15 +101,21 @@ def crear_pedido(
         return nuevo_pedido
 
     except httpx.RequestError:
+        logging.error("Error de conexión con otro microservicio.")
         raise HTTPException(
             status_code=500, detail="Error de conexión con otro microservicio"
+        )
+    except Exception as e:
+        logging.exception("Error inesperado al procesar pedido.")
+        session.rollback()
+        raise HTTPException(
+            status_code=400, detail=f"Error procesando pedido: {str(e)}"
         )
 
 
 @router.get("/pedidos", response_model=list[schemas.PedidoOut])
 def listar_pedidos(
-    token: dict = Depends(auth.verificar_token),
-    session: Session = Depends(db.get_db),
+    token: dict = Depends(auth.verificar_token), session: Session = Depends(db.get_db)
 ):
     return session.query(models.Pedido).all()
 
