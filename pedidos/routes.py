@@ -1,15 +1,52 @@
 from fastapi import APIRouter, Depends, HTTPException
-from pagos.schemas import PagoCreate  # ✅ Importar desde pagos.schemas
+from pagos.schemas import PagoCreate
 from sqlalchemy.orm import Session
 from . import models, schemas, db, auth
 import httpx
 import logging
+import time
 
 PRODUCTOS_URL = "http://127.0.0.1:8000"
 PAGOS_URL = "http://127.0.0.1:8002"
 
 router = APIRouter()
 logging.basicConfig(level=logging.INFO)
+
+
+class CircuitBreaker:
+    def __init__(self, max_failures=3, reset_timeout=10):
+        self.max_failures = max_failures
+        self.reset_timeout = reset_timeout
+        self.failures = 0
+        self.last_failure_time = 0
+        self.open = False
+
+    def call(self, func, *args, **kwargs):
+        if self.open:
+            if time.time() - self.last_failure_time > self.reset_timeout:
+                # Reintentar después del timeout
+                self.open = False
+                self.failures = 0
+            else:
+                raise Exception(
+                    "Circuito abierto. Servicio temporalmente no disponible."
+                )
+
+        try:
+            result = func(*args, **kwargs)
+            self.failures = 0
+            return result
+        except Exception:
+            self.failures += 1
+            self.last_failure_time = time.time()
+            if self.failures >= self.max_failures:
+                self.open = True
+            raise
+
+
+# Instancias de Circuit Breaker para productos y pagos
+productos_cb = CircuitBreaker(max_failures=3, reset_timeout=10)
+pagos_cb = CircuitBreaker(max_failures=3, reset_timeout=10)
 
 
 @router.post("/pedidos", response_model=schemas.PedidoOut)
@@ -23,8 +60,9 @@ def crear_pedido(
 
     try:
         with httpx.Client(timeout=5.0) as client:
-            # 1. Obtener producto
-            resp = client.get(
+            # 1. Obtener producto con Circuit Breaker
+            resp = productos_cb.call(
+                client.get,
                 f"{PRODUCTOS_URL}/productos/{pedido.producto_id}",
                 headers={
                     "Authorization": f"Bearer {auth.crear_token({'sub': 'admin'})}"
@@ -40,7 +78,9 @@ def crear_pedido(
             # 2. Calcular total y descontar stock
             total = producto["precio"] * pedido.cantidad
             nuevo_stock = producto["stock"] - pedido.cantidad
-            stock_resp = client.put(
+
+            stock_resp = productos_cb.call(
+                client.put,
                 f"{PRODUCTOS_URL}/productos/{pedido.producto_id}",
                 json={
                     "nombre": producto["nombre"],
@@ -69,9 +109,10 @@ def crear_pedido(
             session.refresh(nuevo_pedido)
             logging.info(f"Pedido {nuevo_pedido.id} creado exitosamente.")
 
-            # 4. Registrar pago con rollback seguro
+            # 4. Registrar pago con Circuit Breaker y rollback seguro
             pago_data = PagoCreate(pedido_id=nuevo_pedido.id, monto=total)
-            pago_resp = client.post(
+            pago_resp = pagos_cb.call(
+                client.post,
                 f"{PAGOS_URL}/pagos",
                 json=pago_data.dict(),
                 headers={
@@ -82,7 +123,8 @@ def crear_pedido(
             if pago_resp.status_code != 200:
                 logging.error(f"Error al procesar pago para pedido {nuevo_pedido.id}.")
                 # Rollback: devolver stock y eliminar pedido
-                client.put(
+                productos_cb.call(
+                    client.put,
                     f"{PRODUCTOS_URL}/productos/{pedido.producto_id}",
                     json={
                         "nombre": producto["nombre"],

@@ -8,7 +8,7 @@ SECRET_KEY = "supersecreto"
 ALGORITHM = "HS256"
 
 
-def crear_token(data: dict, expira_en: Optional[int] = 30):
+def crear_token(data: dict, expira_en: Optional[int] = 120):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=expira_en)
     to_encode.update({"exp": expire})

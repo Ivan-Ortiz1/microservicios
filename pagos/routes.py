@@ -1,7 +1,18 @@
 # pagos/routes.py
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from . import models, schemas, db, auth
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+)  # Nos permite separar las rutas (endpoints) y Depends: Es una herramienta de FastAPI que inyecta dependencias
+from sqlalchemy.orm import (
+    Session,
+)  # Objeto de SQLAlchemy que representa una conexión activa a la base de datos.
+from . import (
+    models,
+    schemas,
+    db,
+    auth,
+)  # Nuestros módulos donde definimos modelos de DB, validaciones Pydantic, conexión a DB y autenticación.
 
 router = APIRouter()
 
